@@ -616,6 +616,11 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 		return err
 	}
 
+	// create the MC for the drop in default-container-runtime crio.conf file
+	if err := ctrl.createDefaultContainerRuntimeMC(); err != nil {
+		return fmt.Errorf("failed to create the crio-default-container-runtime MC: %w", err)
+	}
+	
 	// Fetch the ContainerRuntimeConfig
 	cfg, err := ctrl.mccrLister.Get(name)
 	if errors.IsNotFound(err) {
@@ -1078,80 +1083,52 @@ func (ctrl *Controller) createDefaultContainerRuntimeMC() error {
 	if !version.IsSCOS() {
 		return nil
 	}
+
 	// Check if the crio-default-container-runtime config map exists in the openshift-machine-config-operator namespace
 	defaultContainerRuntimeCM, err := ctrl.kubeClient.CoreV1().ConfigMaps(ctrl.namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("error checking for %s config map: %w", configMapName, err)
 	}
-	// If the crio-default-container-runtime config map exists, the MC was already created, so skip creating it again.
+
+	// If the crio-default-container-runtime config map exists, this means the 4.17 migration happened.
+	// For 4.20 upgrade, we need to remove the override MCs to revert to the cluster default (crun).
 	if defaultContainerRuntimeCM != nil && !errors.IsNotFound(err) {
+		klog.Infof("ConfigMap %s found, removing runc override MachineConfigs to revert to crun default", configMapName)
+
+		// Find all the MachineConfigPools
+		mcpPoolsAll, err := ctrl.mcpLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+
+		// Delete the crio-default-container-runtime override MCs for master and worker pools
+		for _, pool := range mcpPoolsAll {
+			if pool.Name != ctrlcommon.MachineConfigPoolMaster && pool.Name != ctrlcommon.MachineConfigPoolWorker {
+				continue
+			}
+			managedKey := getManagedKeyDefaultContainerRuntime(pool)
+
+			// Delete the override MachineConfig
+			err := ctrl.client.MachineconfigurationV1().MachineConfigs().Delete(context.TODO(), managedKey, metav1.DeleteOptions{})
+			if err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("error deleting override MachineConfig %s: %w", managedKey, err)
+			}
+			if err == nil {
+				klog.Infof("Deleted override MachineConfig %s for pool %s to revert to crun default", managedKey, pool.Name)
+			}
+		}
+
+		// Delete the ConfigMap marker to indicate cleanup is complete
+		if err := ctrl.kubeClient.CoreV1().ConfigMaps(ctrl.namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("error deleting %s config map: %w", configMapName, err)
+		}
+		klog.Infof("Deleted ConfigMap %s, 4.20 upgrade cleanup complete", configMapName)
+
 		return nil
 	}
 
-	// Find all the MachineConfigPools
-	mcpPoolsAll, err := ctrl.mcpLister.List(labels.Everything())
-	if err != nil {
-		return err
-	}
-
-	// Create the crio-default-container-runtime MC for all the available pools
-	for _, pool := range mcpPoolsAll {
-		if pool.Name != ctrlcommon.MachineConfigPoolMaster && pool.Name != ctrlcommon.MachineConfigPoolWorker {
-			continue
-		}
-		managedKey := getManagedKeyDefaultContainerRuntime(pool)
-		mc, err := ctrl.client.MachineconfigurationV1().MachineConfigs().Get(context.TODO(), managedKey, metav1.GetOptions{})
-		if err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("error checking for %s machine config: %w", managedKey, err)
-		}
-		// continue to the next MC if this already exists
-		if mc != nil && !errors.IsNotFound(err) {
-			continue
-		}
-
-		// Determine the container runtime for the final runtime configuration.
-		currentDefaultRuntime, err := ctrl.determineContainerRuntimeForFinalRuntimeConfig(pool)
-		if err != nil {
-			return fmt.Errorf("could not determine final runtime config for pool %s: %w", pool.Name, err)
-		}
-
-		if currentDefaultRuntime != mcfgv1.ContainerRuntimeDefaultRuntimeEmpty {
-			klog.Infof("default_runtime is already set in existing MachineConfigs for pool %s, skipping MachineConfig creation", pool.Name)
-			continue
-		}
-
-		klog.Infof("default_runtime is not set in any existing MachineConfigs for pool %s, updating it", pool.Name)
-		// Update the default_runtime setting
-		tempIgnCfg := ctrlcommon.NewIgnConfig()
-		mc, err = ctrlcommon.MachineConfigFromIgnConfig(pool.Name, managedKey, tempIgnCfg)
-		if err != nil {
-			return fmt.Errorf("could not create crio-default-container-runtime MachineConfig from new Ignition config: %w", err)
-		}
-		rawRuntimeIgnition, err := json.Marshal(createNewIgnition(createDefaultContainerRuntimeFile()))
-		if err != nil {
-			return fmt.Errorf("error marshalling crio-default-container-runtime config ignition: %w", err)
-		}
-		mc.Spec.Config.Raw = rawRuntimeIgnition
-		// Create the crio-default-container-runtime MC
-		if err := retry.RetryOnConflict(updateBackoff, func() error {
-			_, err = ctrl.client.MachineconfigurationV1().MachineConfigs().Create(context.TODO(), mc, metav1.CreateOptions{})
-			return err
-		}); err != nil {
-			return fmt.Errorf("could not create MachineConfig for crio-default-container-runtime: %w", err)
-		}
-		klog.Infof("Applied default runtime MC %v on MachineConfigPool %v", managedKey, pool.Name)
-	}
-
-	// Create the config map for crio-default-container-runtime so we know that the crio-default-container-runtime MC has been created
-	if defaultContainerRuntimeCM == nil {
-		defaultContainerRuntimeCM = &corev1.ConfigMap{}
-	}
-
-	defaultContainerRuntimeCM.Name = configMapName
-	defaultContainerRuntimeCM.Namespace = ctrl.namespace
-	if _, err := ctrl.kubeClient.CoreV1().ConfigMaps(ctrl.namespace).Create(context.TODO(), defaultContainerRuntimeCM, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("error creating %s config map: %w", configMapName, err)
-	}
+	// ConfigMap does not exist - no cleanup needed (either never migrated or already cleaned up)
+	klog.V(4).Infof("ConfigMap %s not found, no override MachineConfigs to remove", configMapName)
 	return nil
 }
 
