@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration — structured sidecar for REVIEW.md
+# Inherits org-wide settings from https://github.com/openshift/coderabbit
+
+inheritance: true
+language: en-US
+
+reviews:
+  profile: chill
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+  request_changes_workflow: false
+
+  path_filters:
+    - "!manifests/**"
+    - "!templates/**/*.yaml"
+
+  path_instructions:
+    - path: "pkg/controller/**"
+      instructions: |
+        Verify apply method uses lib/resourceapply (Get+Create/Update), never SSA.
+        New controllers must implement ctrlcommon.Controller interface.
+        Check informer event handlers enqueue the correct object key.
+
+    - path: "pkg/daemon/**"
+      instructions: |
+        High-churn area. Check MachineConfigNode condition updates match the
+        state machine (UpdatePrepared through Updated). Verify both rebootless
+        and reboot paths. Flag new SELinux workarounds for SME review.
+
+    - path: "pkg/operator/**"
+      instructions: |
+        Verify syncAvailableStatus never sets Available=False for non-critical
+        issues. Check createDiscoveredControllerConfigSpec handles all platforms.
+        Verify image version matches operator version.
+
+    - path: "lib/resourceapply/**"
+      instructions: |
+        Changes here affect ALL controllers. Verify IsApplyErrorRetriable covers
+        new error classes. Ensure resourcemerge.Ensure* functions correctly set
+        the modified bool.
+
+    - path: "cmd/**"
+      instructions: |
+        Controller startup ordering is critical. EnsureOSImageStream must remain
+        the first blocking call in MCC. Feature-gated controllers must check
+        the gate before starting.
+
+    - path: "test/**"
+      instructions: |
+        E2E tests must target the correct shard. OCL tests go in e2e-ocl-*.
+        TechPreview tests go in e2e-techpreview. Verify test cleanup avoids
+        flaky state leaks.
+
+  auto_review:
+    enabled: true
+    drafts: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "REVIEW.md"
+      - "AGENTS.md"
+  learnings:
+    scope: local
